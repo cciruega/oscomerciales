@@ -2,6 +2,7 @@
 """Funciones de procesamiento para el Portal de Órdenes Comerciales Pendientes."""
 from __future__ import annotations
 
+import csv
 import io
 import math
 import re
@@ -437,26 +438,103 @@ COPE_MAP = {normalizar_texto(k): v for k, v in COPE_MAP_RAW.items()}
 
 
 def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
-    """Lee un archivo delimitado por | y permite codificaciones habituales de Windows."""
-    errores = []
-    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+    """Lee una sábana separada por | sin dejar que comillas anómalas traguen columnas.
+
+    En algunas sábanas existe una comilla suelta en un campo de texto (por ejemplo,
+    cerca de AJ). Como | sigue siendo el delimitador real de la sábana, primero
+    tratamos las comillas como caracteres ordinarios. Si una fila no coincide con
+    el número de columnas del encabezado, probamos interpretar comillas CSV válidas
+    solo para esa fila. Nunca omitimos filas silenciosamente.
+    """
+    errores_decode: list[str] = []
+    candidatos: list[tuple[str, str]] = []
+
+    # Probar codificaciones comunes. cp1252 puede fallar con el byte 0x90;
+    # por eso hay una segunda variante que reemplaza únicamente bytes inválidos.
+    for encoding in ("utf-8-sig", "cp1252"):
         try:
-            df = pd.read_csv(
-                io.BytesIO(contenido),
-                sep="|",
-                dtype=str,
-                encoding=encoding,
-                keep_default_na=False,
-                low_memory=False,
-                on_bad_lines="error",
-            )
-            # Si Pandas solo ve una columna, probablemente el separador no es el esperado.
-            if len(df.columns) < 2:
-                raise ValueError("El archivo no se pudo separar por |. Verifica que sea la sábana TXT original.")
-            return df, encoding
-        except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as exc:
-            errores.append(f"{encoding}: {exc}")
-    raise ValueError("No se pudo leer la sábana. Revisa que la descarga esté completa y que use | como delimitador. " + " / ".join(errores[-2:]))
+            candidatos.append((contenido.decode(encoding), encoding))
+        except UnicodeDecodeError as exc:
+            errores_decode.append(f"{encoding}: byte no válido en posición {exc.start}")
+
+    try:
+        candidatos.append((contenido.decode("cp1252", errors="replace"),
+                           "cp1252 (caracteres inválidos reemplazados)"))
+    except Exception as exc:  # pragma: no cover - solo protección adicional
+        errores_decode.append(f"cp1252 con reemplazo: {exc}")
+    candidatos.append((contenido.decode("latin-1"), "latin-1"))
+
+    errores_parseo: list[str] = []
+    for texto, encoding in candidatos:
+        # La sábana es registro por línea. Usamos QUOTE_NONE para que una comilla
+        # sin escapar dentro de un campo no haga que los | siguientes se ignoren.
+        lineas = texto.splitlines()
+        idx_encabezado = next((i for i, linea in enumerate(lineas) if linea.strip()), None)
+        if idx_encabezado is None:
+            errores_parseo.append(f"{encoding}: archivo vacío")
+            continue
+
+        try:
+            encabezado = next(csv.reader(
+                [lineas[idx_encabezado]], delimiter="|", quoting=csv.QUOTE_NONE,
+                skipinitialspace=False,
+            ))
+            encabezado = [c.lstrip("\ufeff") for c in encabezado]
+            columnas_esperadas = len(encabezado)
+            if columnas_esperadas < 2:
+                raise ValueError("el archivo no parece estar delimitado por |")
+
+            filas: list[list[str]] = []
+            filas_malas: list[str] = []
+            for num_linea, linea in enumerate(lineas[idx_encabezado + 1:], start=idx_encabezado + 2):
+                if not linea.strip():
+                    continue
+
+                # Primera opción: todas las | son delimitadores, las comillas son texto.
+                campos = next(csv.reader(
+                    [linea], delimiter="|", quoting=csv.QUOTE_NONE,
+                    skipinitialspace=False,
+                ))
+
+                if len(campos) != columnas_esperadas:
+                    # Respaldo para filas legítimas con un campo entrecomillado que
+                    # contenga |. Solo se acepta si coincide exactamente con el header.
+                    try:
+                        campos_csv = next(csv.reader(
+                            [linea], delimiter="|", quotechar='"',
+                            quoting=csv.QUOTE_MINIMAL, strict=True,
+                        ))
+                    except csv.Error:
+                        campos_csv = []
+                    if len(campos_csv) == columnas_esperadas:
+                        campos = campos_csv
+                    else:
+                        filas_malas.append(
+                            f"línea {num_linea}: {len(campos)} columnas (se esperaban {columnas_esperadas})"
+                        )
+                        continue
+                filas.append(campos)
+
+            if filas_malas:
+                muestra = "; ".join(filas_malas[:5])
+                mas = f"; y {len(filas_malas) - 5} filas adicionales" if len(filas_malas) > 5 else ""
+                raise ValueError(f"no coinciden las columnas en {len(filas_malas)} filas: {muestra}{mas}")
+
+            if not filas:
+                raise ValueError("no se encontraron filas de datos después del encabezado")
+
+            df = pd.DataFrame(filas, columns=encabezado, dtype=str).fillna("")
+            return df, encoding + " (comillas tratadas como texto; delimitación por | y validación de columnas)"
+
+        except (csv.Error, ValueError, IndexError) as exc:
+            errores_parseo.append(f"{encoding}: {exc}")
+
+    detalle = " / ".join((errores_decode + errores_parseo)[-5:])
+    raise ValueError(
+        "No se pudo leer la sábana sin perder columnas. Se intentó tratar las comillas "
+        "como texto y validar el número de campos por fila. "
+        f"Detalle: {detalle}"
+    )
 
 
 def _buscar_columna(df: pd.DataFrame, objetivo: str) -> str | None:
@@ -579,6 +657,15 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         advertencias.append("No se detectó la columna catDescCope; las filas sin código Central quedarán como SIN ASIGNAR.")
     if no_asignadas:
         advertencias.append(f"{no_asignadas:,} registros de etapas válidas no pudieron asociarse a una tienda.")
+    if "caracteres inválidos reemplazados" in encoding:
+        advertencias.append(
+            "El TXT contiene uno o más bytes no válidos en Windows-1252; se reemplazaron esos caracteres para poder leer el resto del archivo."
+        )
+    if "comillas tratadas como texto" in encoding:
+        advertencias.append(
+            "La lectura CSV estándar detectó comillas sin cerrar. Se releyó tratando las comillas como texto para conservar las filas. "
+            "Si algún campo de texto contiene el delimitador |, revisa la sábana original."
+        )
     if horas_invalidas:
         advertencias.append(f"{horas_invalidas:,} registros de etapas válidas tienen dilación vacía o no numérica y no entran al resumen.")
     if len(df) < 10_000:
