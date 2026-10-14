@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+gspread
+google-auth
+streamlit-option-menu
+requests
+st-gsheets-connection
+openpyxl
