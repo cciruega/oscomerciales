@@ -14,6 +14,7 @@ import pandas as pd
 ETAPAS_VALIDAS = ["C8", "CD", "CL", "CO", "CP", "CW", "OQ", "SN", "TL", "PP"]
 UMBRAL_HORAS = 25  # Hora 25 en adelante
 REGIONES = ["MONTERREY 1", "MONTERREY 2", "MONTERREY 3"]
+VERSION_LECTOR = "recuperacion-lineas-aisladas-v2"
 
 CENTRAL_MAP = {
     '95L': 'CAT GES',
@@ -438,19 +439,18 @@ COPE_MAP = {normalizar_texto(k): v for k, v in COPE_MAP_RAW.items()}
 
 
 def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
-    """Lee una sábana separada por | sin dejar que comillas anómalas traguen columnas.
+    """Lee una sábana delimitada por | y recupera una única línea física aislada.
 
-    En algunas sábanas existe una comilla suelta en un campo de texto (por ejemplo,
-    cerca de AJ). Como | sigue siendo el delimitador real de la sábana, primero
-    tratamos las comillas como caracteres ordinarios. Si una fila no coincide con
-    el número de columnas del encabezado, probamos interpretar comillas CSV válidas
-    solo para esa fila. Nunca omitimos filas silenciosamente.
+    Las sábanas observadas traen ocasionalmente una línea física con un solo campo
+    (sin |) en la zona de texto de AJ / Responsable Etapa. Esa línea aislada no es
+    un registro de 118 columnas: se incorpora como continuación textual en AJ del
+    registro anterior. Así no se desplazan los campos clave Etapa PISA, Central,
+    catDescCope y DilacionHorasEtapa. Si hay otras filas mal formadas, el archivo
+    se rechaza con detalle en vez de descartar datos silenciosamente.
     """
     errores_decode: list[str] = []
     candidatos: list[tuple[str, str]] = []
 
-    # Probar codificaciones comunes. cp1252 puede fallar con el byte 0x90;
-    # por eso hay una segunda variante que reemplaza únicamente bytes inválidos.
     for encoding in ("utf-8-sig", "cp1252"):
         try:
             candidatos.append((contenido.decode(encoding), encoding))
@@ -460,14 +460,12 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
     try:
         candidatos.append((contenido.decode("cp1252", errors="replace"),
                            "cp1252 (caracteres inválidos reemplazados)"))
-    except Exception as exc:  # pragma: no cover - solo protección adicional
+    except Exception as exc:  # protección adicional
         errores_decode.append(f"cp1252 con reemplazo: {exc}")
     candidatos.append((contenido.decode("latin-1"), "latin-1"))
 
     errores_parseo: list[str] = []
     for texto, encoding in candidatos:
-        # La sábana es registro por línea. Usamos QUOTE_NONE para que una comilla
-        # sin escapar dentro de un campo no haga que los | siguientes se ignoren.
         lineas = texto.splitlines()
         idx_encabezado = next((i for i, linea in enumerate(lineas) if linea.strip()), None)
         if idx_encabezado is None:
@@ -482,23 +480,33 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
             encabezado = [c.lstrip("\ufeff") for c in encabezado]
             columnas_esperadas = len(encabezado)
             if columnas_esperadas < 2:
-                raise ValueError("el archivo no parece estar delimitado por |")
+                raise ValueError("el archivo no parece estar delimitado por '|' ")
+
+            # AJ es el campo 36 (índice 35 en Python). Si el nombre conocido cambia,
+            # se conserva la posición AJ de la sábana original como respaldo.
+            indice_aj = next(
+                (i for i, c in enumerate(encabezado)
+                 if normalizar_texto(c) in {"RESPONSABLEETAPA", "RESPONSABLEDEETAPA"}),
+                35 if columnas_esperadas >= 36 else columnas_esperadas - 1,
+            )
 
             filas: list[list[str]] = []
             filas_malas: list[str] = []
+            lineas_recuperadas: list[int] = []
+
             for num_linea, linea in enumerate(lineas[idx_encabezado + 1:], start=idx_encabezado + 2):
                 if not linea.strip():
                     continue
 
-                # Primera opción: todas las | son delimitadores, las comillas son texto.
+                # El carácter | es el separador de la sábana; las comillas sueltas
+                # deben tratarse como texto en primera instancia.
                 campos = next(csv.reader(
                     [linea], delimiter="|", quoting=csv.QUOTE_NONE,
                     skipinitialspace=False,
                 ))
 
                 if len(campos) != columnas_esperadas:
-                    # Respaldo para filas legítimas con un campo entrecomillado que
-                    # contenga |. Solo se acepta si coincide exactamente con el header.
+                    # Respaldo para una fila correctamente entrecomillada que contiene |.
                     try:
                         campos_csv = next(csv.reader(
                             [linea], delimiter="|", quotechar='"',
@@ -508,6 +516,21 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
                         campos_csv = []
                     if len(campos_csv) == columnas_esperadas:
                         campos = campos_csv
+                    elif (
+                        len(campos) == 1
+                        and len(filas) > 0
+                        and columnas_esperadas >= 36
+                    ):
+                        # Puede haber más de una continuación aislada en una sábana.
+                        # Recuperamos TODAS las líneas físicas sin delimitadores que
+                        # aparecen después de un registro, anexándolas a AJ. La
+                        # recuperación no cambia la cantidad de filas ni desplaza
+                        # columnas utilizadas para etapa, Central, COPE o dilación.
+                        actual = filas[-1][indice_aj]
+                        fragmento = campos[0]
+                        filas[-1][indice_aj] = f"{actual}\n{fragmento}" if actual else fragmento
+                        lineas_recuperadas.append(num_linea)
+                        continue
                     else:
                         filas_malas.append(
                             f"línea {num_linea}: {len(campos)} columnas (se esperaban {columnas_esperadas})"
@@ -518,21 +541,30 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
             if filas_malas:
                 muestra = "; ".join(filas_malas[:5])
                 mas = f"; y {len(filas_malas) - 5} filas adicionales" if len(filas_malas) > 5 else ""
-                raise ValueError(f"no coinciden las columnas en {len(filas_malas)} filas: {muestra}{mas}")
+                raise ValueError(
+                    f"no coinciden las columnas en {len(filas_malas)} filas: {muestra}{mas}"
+                )
 
             if not filas:
                 raise ValueError("no se encontraron filas de datos después del encabezado")
 
             df = pd.DataFrame(filas, columns=encabezado, dtype=str).fillna("")
-            return df, encoding + " (comillas tratadas como texto; delimitación por | y validación de columnas)"
+            detalle_encoding = encoding + " (separador |; comillas tratadas como texto)"
+            if lineas_recuperadas:
+                numeros = ", ".join(str(n) for n in lineas_recuperadas)
+                detalle_encoding += (
+                    f"; línea(s) aislada(s) {numeros} anexada(s) al campo AJ "
+                    "del registro anterior para preservar las 118 columnas"
+                )
+            return df, detalle_encoding
 
         except (csv.Error, ValueError, IndexError) as exc:
             errores_parseo.append(f"{encoding}: {exc}")
 
     detalle = " / ".join((errores_decode + errores_parseo)[-5:])
     raise ValueError(
-        "No se pudo leer la sábana sin perder columnas. Se intentó tratar las comillas "
-        "como texto y validar el número de campos por fila. "
+        "No se pudo leer la sábana conservando las columnas. Se intentó leer las comillas "
+        "como texto y validar cada fila. "
         f"Detalle: {detalle}"
     )
 
@@ -674,6 +706,14 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         advertencias.append(
             "La lectura CSV estándar detectó comillas sin cerrar. Se releyó tratando las comillas como texto para conservar las filas. "
             "Si algún campo de texto contiene el delimitador |, revisa la sábana original."
+        )
+    if "línea(s) aislada(s)" in encoding:
+        detalle_recuperacion = encoding.split("; línea(s) aislada(s) ", 1)[-1]
+        advertencias.append(
+            "Se recuperó una o más líneas físicas aisladas anexándolas al campo AJ (Responsable Etapa) "
+            "del registro anterior. "
+            "Las columnas de etapa, Central, COPE y dilación se conservaron sin desplazarse. "
+            f"Detalle de recuperación: {detalle_recuperacion}."
         )
     if horas_invalidas:
         advertencias.append(f"{horas_invalidas:,} registros de etapas válidas tienen dilación vacía o no numérica y no entran al resumen.")
