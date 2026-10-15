@@ -14,7 +14,7 @@ import pandas as pd
 ETAPAS_VALIDAS = ["C8", "CD", "CL", "CO", "CP", "CW", "OQ", "SN", "TL", "PP"]
 UMBRAL_HORAS = 25  # Hora 25 en adelante
 REGIONES = ["MONTERREY 1", "MONTERREY 2", "MONTERREY 3"]
-VERSION_LECTOR = "recuperacion-lineas-aisladas-v2"
+VERSION_LECTOR = "recuperacion-lineas-aisladas-v3-excel-seguro"
 
 CENTRAL_MAP = {
     '95L': 'CAT GES',
@@ -569,6 +569,36 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
     )
 
 
+# Excel/XML no admite varios caracteres de control ASCII en el contenido de las celdas.
+# Algunos TXT operativos contienen estos bytes (por ejemplo, \x1a) dentro de campos
+# descriptivos. Se eliminan esos caracteres únicamente; no se elimina ninguna fila ni columna.
+_CARACTERES_CONTROL_NO_EXCEL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def _limpiar_controles_no_excel(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Retira caracteres de control incompatibles con Excel y devuelve cuántos quitó."""
+    resultado = df.copy()
+    total_eliminados = 0
+
+    columnas_limpias = []
+    for nombre in resultado.columns:
+        nombre_limpio, cantidad = _CARACTERES_CONTROL_NO_EXCEL.subn("", str(nombre))
+        columnas_limpias.append(nombre_limpio)
+        total_eliminados += cantidad
+    resultado.columns = columnas_limpias
+
+    # La lectura de _leer_txt entrega cadenas; pandas .str ejecuta el saneamiento
+    # por columna de manera vectorizada incluso para las sábanas de decenas de miles de filas.
+    for nombre in resultado.columns:
+        serie = resultado[nombre]
+        if pd.api.types.is_object_dtype(serie.dtype) or pd.api.types.is_string_dtype(serie.dtype):
+            texto = serie.astype("string")
+            cantidades = texto.str.count(_CARACTERES_CONTROL_NO_EXCEL).fillna(0)
+            total_eliminados += int(cantidades.sum())
+            resultado[nombre] = texto.str.replace(_CARACTERES_CONTROL_NO_EXCEL, "", regex=True).fillna("")
+
+    return resultado, total_eliminados
+
+
 def _buscar_columna(df: pd.DataFrame, objetivo: str) -> str | None:
     """Encuentra encabezados incluso si tienen acentos, espacios o diferencias de mayúsculas."""
     normalizados = [(c, normalizar_texto(c)) for c in df.columns]
@@ -644,6 +674,7 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
     if not contenido:
         raise ValueError("El archivo está vacío.")
     df, encoding = _leer_txt(contenido)
+    df, caracteres_control_eliminados = _limpiar_controles_no_excel(df)
     if df.empty:
         raise ValueError("El archivo se leyó, pero no contiene registros de datos.")
 
@@ -692,6 +723,11 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
     no_asignadas = int((tiendas.loc[mascara_etapa] == "SIN ASIGNAR").sum())
     horas_invalidas = int((mascara_etapa & horas.isna()).sum())
     advertencias = []
+    if caracteres_control_eliminados:
+        advertencias.append(
+            f"Se retiraron {caracteres_control_eliminados:,} caracteres de control no admitidos por Excel. "
+            "No se eliminaron filas ni columnas; solo se limpiaron esos caracteres dentro de los textos."
+        )
     if col_central is None:
         advertencias.append("No se detectó la columna Central; se intentará asignar tienda mediante catDescCope.")
     if col_cope is None:
@@ -732,6 +768,7 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         "dilacion_por_posicion": dilacion_por_posicion,
         "encoding": encoding,
         "bytes": len(contenido),
+        "caracteres_control_eliminados": int(caracteres_control_eliminados),
         "advertencias": advertencias,
     }
     # "detalle" se reserva para el Excel integrado: exclusivamente folios pendientes
@@ -743,3 +780,4 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         "detalle_etapas_validas": detalle_etapas_validas,
         "metricas": metrics,
     }
+
