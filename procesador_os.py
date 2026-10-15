@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 
 ETAPAS_VALIDAS = ["C8", "CD", "CL", "CO", "CP", "CW", "OQ", "SN", "TL", "PP"]
-UMBRAL_HORAS = 25  # Hora 25 en adelante
+UMBRAL_HORAS = 5  # Hora 5 en adelante
 REGIONES = ["MONTERREY 1", "MONTERREY 2", "MONTERREY 3"]
 VERSION_LECTOR = "recuperacion-lineas-aisladas-v3-excel-seguro"
 
@@ -708,7 +708,7 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         return detalle
 
     # Separamos las filas que tienen etapa válida del subconjunto que realmente
-    # está pendiente: etapa válida Y dilación de 25 horas o más.
+    # está pendiente: etapa válida Y dilación de 5 horas o más.
     detalle_etapas_validas = enriquecer_detalle(mascara_etapa)
     detalle_pendientes = enriquecer_detalle(mascara_mayor)
 
@@ -760,7 +760,7 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         "region": region,
         "filas_leidas": int(len(df)),
         "etapas_validas": int(mascara_etapa.sum()),
-        "folios_25_mas": int(mascara_mayor.sum()),
+        "folios_5_mas": int(mascara_mayor.sum()),
         "sin_asignar": no_asignadas,
         "horas_invalidas": horas_invalidas,
         "columna_etapa": str(col_etapa),
@@ -772,7 +772,7 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         "advertencias": advertencias,
     }
     # "detalle" se reserva para el Excel integrado: exclusivamente folios pendientes
-    # (etapa válida y dilación >= 25 h). La vista de todas las etapas válidas queda
+    # (etapa válida y dilación >= 5 h). La vista de todas las etapas válidas queda
     # disponible por separado para auditoría/consulta si se requiere.
     return {
         "resumen": resumen,
