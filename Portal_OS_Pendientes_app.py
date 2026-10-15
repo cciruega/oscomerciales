@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -27,6 +28,28 @@ except Exception as exc:
     )
     st.code(f"{type(exc).__name__}: {exc}")
     st.stop()
+
+
+# Excel/OpenXML no admite ciertos caracteres de control en las celdas.
+# Se eliminan solo esos caracteres, nunca filas ni columnas.
+_CARACTERES_NO_VALIDOS_EXCEL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def _preparar_dataframe_excel(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    seguro = df.copy()
+    eliminados = 0
+    columnas = []
+    for nombre in seguro.columns:
+        limpio, n = _CARACTERES_NO_VALIDOS_EXCEL.subn("", str(nombre))
+        columnas.append(limpio)
+        eliminados += n
+    seguro.columns = columnas
+    for nombre in seguro.columns:
+        serie = seguro[nombre]
+        if pd.api.types.is_object_dtype(serie.dtype) or pd.api.types.is_string_dtype(serie.dtype):
+            texto = serie.astype("string")
+            eliminados += int(texto.str.count(_CARACTERES_NO_VALIDOS_EXCEL).fillna(0).sum())
+            seguro[nombre] = texto.str.replace(_CARACTERES_NO_VALIDOS_EXCEL, "", regex=True).fillna("")
+    return seguro, eliminados
 
 st.markdown("""
 <style>
@@ -111,8 +134,18 @@ for idx, region in enumerate(REGIONES, start=1):
                 st.write(f"**Codificación leída:** `{m['encoding']}` · **Tamaño:** {m['bytes'] / (1024*1024):.2f} MB")
                 st.write("**Etapas consideradas:** " + ", ".join(ETAPAS_VALIDAS))
                 if not resultado["detalle"].empty:
-                    st.dataframe(resultado["detalle"].head(100), use_container_width=True, hide_index=True)
-                    st.caption("Vista previa de hasta 100 folios pendientes exportados: etapa válida y dilación desde la hora 25.")
+                    # La vista previa usa el detalle completo, no un recorte de 100 filas.
+                    # Streamlit permite recorrer todo el conjunto dentro de la tabla.
+                    st.dataframe(
+                        resultado["detalle"],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=520,
+                    )
+                    st.caption(
+                        f"Vista completa: {len(resultado['detalle']):,} folios pendientes. "
+                        "Puedes recorrer todos los registros en la tabla; el Excel también incluye la totalidad."
+                    )
         except Exception as exc:
             st.error(f"No se pudo procesar {region}: {exc}")
             st.info("Verifica que el archivo corresponda a esa región, que la descarga esté completa y que incluya los encabezados Etapa PISA y DilacionHorasEtapa.")
@@ -166,8 +199,9 @@ else:
         st.error("Se bloqueó la integración porque los conteos de resumen y detalle no coinciden: " + "; ".join(errores_integracion))
     else:
         st.markdown("### Exportar resultados")
-        st.caption("El Excel incluye un resumen por región, el detalle completo de folios pendientes (etapa válida y dilación ≥ 25 h) y una hoja de control con conteos comparables.")
+        st.caption("El Excel incluye un resumen por región, todos los folios pendientes (etapa válida y dilación ≥ 25 h) y una hoja de control. Los caracteres de control no admitidos por Excel se limpian sin eliminar registros.")
         buffer = io.BytesIO()
+        caracteres_control_limpiados_excel = 0
         try:
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 control = []
@@ -185,14 +219,19 @@ else:
                         f"Detalle Integrado contiene {len(detalle_integrado):,} filas, "
                         f"pero el control calcula {total_pendientes_esperado:,} folios pendientes."
                     )
-                detalle_integrado.to_excel(writer, sheet_name="Detalle Integrado", index=False)
+                detalle_integrado_excel, n_limpios = _preparar_dataframe_excel(detalle_integrado)
+                caracteres_control_limpiados_excel += n_limpios
+                detalle_integrado_excel.to_excel(writer, sheet_name="Detalle Integrado", index=False)
 
                 for region in REGIONES:
                     resultado = resultados[region]
                     m = resultado["metricas"]
                     sufijo = region.replace("MONTERREY ", "MTY ")
-                    resultado["resumen"].to_excel(writer, sheet_name=f"Resumen {sufijo}"[:31], index=False)
-                    resultado["detalle"].to_excel(writer, sheet_name=f"Detalle {sufijo}"[:31], index=False)
+                    resumen_excel, n_limpios_resumen = _preparar_dataframe_excel(resultado["resumen"])
+                    detalle_excel, n_limpios_detalle = _preparar_dataframe_excel(resultado["detalle"])
+                    caracteres_control_limpiados_excel += n_limpios_resumen + n_limpios_detalle
+                    resumen_excel.to_excel(writer, sheet_name=f"Resumen {sufijo}"[:31], index=False)
+                    detalle_excel.to_excel(writer, sheet_name=f"Detalle {sufijo}"[:31], index=False)
                     control.append({
                         "Área": region,
                         "Registros leídos": m["filas_leidas"],
@@ -217,7 +256,9 @@ else:
                     "Nombre columna etapa": "—",
                     "Nombre columna dilación": "—",
                 })
-                pd.DataFrame(control).to_excel(writer, sheet_name="Control", index=False)
+                control_excel, n_limpios_control = _preparar_dataframe_excel(pd.DataFrame(control))
+                caracteres_control_limpiados_excel += n_limpios_control
+                control_excel.to_excel(writer, sheet_name="Control", index=False)
                 for ws in writer.book.worksheets:
                     ws.freeze_panes = "A2"
                     ws.auto_filter.ref = ws.dimensions
@@ -225,6 +266,11 @@ else:
                         max_len = max((len(str(c.value or "")) for c in list(col_cells)[:300]), default=10)
                         ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_len + 2, 10), 38)
             excel_bytes = buffer.getvalue()
+            if caracteres_control_limpiados_excel:
+                st.warning(
+                    f"Para generar Excel se limpiaron {caracteres_control_limpiados_excel:,} caracteres de control "
+                    "no admitidos por el formato. No se eliminaron folios, filas ni columnas."
+                )
             st.download_button(
                 "Descargar Excel integrado",
                 data=excel_bytes,
