@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- cod# -*- coding: utf-8 -*-
 """Funciones de procesamiento para el Portal de Órdenes Comerciales Pendientes."""
 from __future__ import annotations
 
