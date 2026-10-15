@@ -73,7 +73,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="portal-title">ORDENES COMERCIALES<br>PENDIENTES</div>', unsafe_allow_html=True)
-st.caption("Carga cada sábana TXT por separado. Las tablas y el Excel integrado incluyen únicamente folios con etapa válida y dilación desde la hora 25.")
+st.caption("Carga cada sábana TXT por separado. Las tablas y el Excel integrado incluyen únicamente folios con etapa válida y dilación desde la hora 5.")
 
 @st.cache_data(show_spinner=False, max_entries=6)
 def procesar_en_cache(contenido: bytes, region: str, version_lector: str):
@@ -85,7 +85,7 @@ resultados = {}
 
 for idx, region in enumerate(REGIONES, start=1):
     st.markdown('<div class="region-title">{}</div>'.format(region), unsafe_allow_html=True)
-    st.markdown('<div class="region-subtitle">Folios mayores a 24 hrs (desde hora 25)</div>'.format(UMBRAL_HORAS), unsafe_allow_html=True)
+    st.markdown('<div class="region-subtitle">Folios mayores a 5 hrs (desde hora 5)</div>'.format(UMBRAL_HORAS), unsafe_allow_html=True)
     archivo = st.file_uploader(
         f"Subir sábana TXT de {region.title()}",
         type=["txt", "csv"],
@@ -101,7 +101,7 @@ for idx, region in enumerate(REGIONES, start=1):
             st.markdown(
                 f'<div class="small-meta">Registros leídos: <b>{m["filas_leidas"]:,}</b> '
                 f'&nbsp;·&nbsp; Etapas válidas: <b>{m["etapas_validas"]:,}</b> '
-                f'&nbsp;·&nbsp; Folios desde hora 25: <b>{m["folios_25_mas"]:,}</b></div>',
+                f'&nbsp;·&nbsp; Folios desde hora 5: <b>{m["folios_5_mas"]:,}</b></div>',
                 unsafe_allow_html=True,
             )
             if m["advertencias"]:
@@ -127,7 +127,7 @@ for idx, region in enumerate(REGIONES, start=1):
                     unsafe_allow_html=True,
                 )
             else:
-                st.info("No se encontraron folios que cumplan simultáneamente las etapas válidas y la dilación desde la hora 25.")
+                st.info("No se encontraron folios que cumplan simultáneamente las etapas válidas y la dilación desde la hora 5.")
             with st.expander(f"Detalle de lectura y asignación — {region}"):
                 st.write(f"**Columna de etapa detectada:** `{m['columna_etapa']}`")
                 st.write(f"**Columna de dilación detectada:** `{m['columna_dilacion']}`" + (" (respaldo por posición BQ)" if m["dilacion_por_posicion"] else ""))
@@ -174,32 +174,32 @@ elif integridad_sospechosa:
     st.error("La descarga del Excel integrado está bloqueada porque al menos una sábana parece incompleta. Corrige o vuelve a descargar ese TXT y cárgalo nuevamente.")
 else:
     # Verificación cruzada: el detalle exportado debe contener exactamente las
-    # filas contadas como folios desde la hora 25, y el resumen debe sumar lo mismo.
+    # filas contadas como folios desde la hora 5, y el resumen debe sumar lo mismo.
     errores_integracion = []
     for region in REGIONES:
         resultado = resultados[region]
         m = resultado["metricas"]
         filas_detalle = len(resultado["detalle"])
-        if filas_detalle != m["folios_25_mas"]:
+        if filas_detalle != m["folios_5_mas"]:
             errores_integracion.append(
-                f"{region}: detalle={filas_detalle:,}, métrica >=25 h={m['folios_25_mas']:,}"
+                f"{region}: detalle={filas_detalle:,}, métrica >=5 h={m['folios_5_mas']:,}"
             )
         if not resultado["resumen"].empty and "Total general" in resultado["resumen"].columns:
             total_resumen = int(pd.to_numeric(resultado["resumen"]["Total general"], errors="coerce").fillna(0).iloc[-1])
-            if total_resumen != m["folios_25_mas"]:
+            if total_resumen != m["folios_5_mas"]:
                 errores_integracion.append(
-                    f"{region}: resumen={total_resumen:,}, métrica >=25 h={m['folios_25_mas']:,}"
+                    f"{region}: resumen={total_resumen:,}, métrica >=5 h={m['folios_5_mas']:,}"
                 )
-        elif m["folios_25_mas"] != 0:
+        elif m["folios_5_mas"] != 0:
             errores_integracion.append(
-                f"{region}: el resumen está vacío aunque se detectaron {m['folios_25_mas']:,} folios >=25 h"
+                f"{region}: el resumen está vacío aunque se detectaron {m['folios_5_mas']:,} folios >=5 h"
             )
 
     if errores_integracion:
         st.error("Se bloqueó la integración porque los conteos de resumen y detalle no coinciden: " + "; ".join(errores_integracion))
     else:
         st.markdown("### Exportar resultados")
-        st.caption("El Excel incluye un resumen por región, todos los folios pendientes (etapa válida y dilación ≥ 25 h) y una hoja de control. Los caracteres de control no admitidos por Excel se limpian sin eliminar registros.")
+        st.caption("El Excel incluye un resumen por región, todos los folios pendientes (etapa válida y dilación ≥ 5 h) y una hoja de control. Los caracteres de control no admitidos por Excel se limpian sin eliminar registros.")
         buffer = io.BytesIO()
         caracteres_control_limpiados_excel = 0
         try:
@@ -212,7 +212,7 @@ else:
                     ignore_index=True,
                 )
                 total_pendientes_esperado = sum(
-                    int(resultados[region]["metricas"]["folios_25_mas"]) for region in REGIONES
+                    int(resultados[region]["metricas"]["folios_5_mas"]) for region in REGIONES
                 )
                 if len(detalle_integrado) != total_pendientes_esperado:
                     raise ValueError(
@@ -236,9 +236,9 @@ else:
                         "Área": region,
                         "Registros leídos": m["filas_leidas"],
                         "Etapas válidas": m["etapas_validas"],
-                        "Folios desde hora 25": m["folios_25_mas"],
+                        "Folios desde hora 5": m["folios_5_mas"],
                         "Filas exportadas en detalle": len(resultado["detalle"]),
-                        "Diferencia detalle vs folios pendientes": len(resultado["detalle"]) - m["folios_25_mas"],
+                        "Diferencia detalle vs folios pendientes": len(resultado["detalle"]) - m["folios_5_mas"],
                         "Sin tienda asignada": m["sin_asignar"],
                         "Dilación vacía/no numérica": m["horas_invalidas"],
                         "Nombre columna etapa": m["columna_etapa"],
@@ -248,7 +248,7 @@ else:
                     "Área": "TOTAL TRES REGIONES",
                     "Registros leídos": sum(int(resultados[r]["metricas"]["filas_leidas"]) for r in REGIONES),
                     "Etapas válidas": sum(int(resultados[r]["metricas"]["etapas_validas"]) for r in REGIONES),
-                    "Folios desde hora 25": total_pendientes_esperado,
+                    "Folios desde hora 5": total_pendientes_esperado,
                     "Filas exportadas en detalle": len(detalle_integrado),
                     "Diferencia detalle vs folios pendientes": len(detalle_integrado) - total_pendientes_esperado,
                     "Sin tienda asignada": sum(int(resultados[r]["metricas"]["sin_asignar"]) for r in REGIONES),
