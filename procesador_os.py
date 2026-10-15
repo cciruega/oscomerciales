@@ -486,7 +486,6 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
 
             filas: list[list[str]] = []
             filas_malas: list[str] = []
-            lineas_sueltas_recuperadas: list[int] = []
             for num_linea, linea in enumerate(lineas[idx_encabezado + 1:], start=idx_encabezado + 2):
                 if not linea.strip():
                     continue
@@ -498,19 +497,6 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
                 ))
 
                 if len(campos) != columnas_esperadas:
-                    # Recuperación segura para la anomalía reportada: hay una línea
-                    # física aislada sin ningún | (1 campo), probablemente causada por
-                    # un salto de línea dentro de un campo de texto o una comilla suelta.
-                    # No la tratamos como un registro nuevo. Se anexa al último campo
-                    # de la fila anterior, que no participa en los filtros principales,
-                    # y se informa en la métrica de lectura. Así no se desplazan las
-                    # columnas Etapa PISA, Central, catDescCope ni DilacionHorasEtapa.
-                    if len(campos) == 1 and filas:
-                        fragmento = campos[0]
-                        filas[-1][-1] = (filas[-1][-1] + "\n" + fragmento).strip("\n")
-                        lineas_sueltas_recuperadas.append(num_linea)
-                        continue
-
                     # Respaldo para filas legítimas con un campo entrecomillado que
                     # contenga |. Solo se acepta si coincide exactamente con el header.
                     try:
@@ -538,14 +524,7 @@ def _leer_txt(contenido: bytes) -> tuple[pd.DataFrame, str]:
                 raise ValueError("no se encontraron filas de datos después del encabezado")
 
             df = pd.DataFrame(filas, columns=encabezado, dtype=str).fillna("")
-            descripcion_lectura = encoding + " (comillas tratadas como texto; delimitación por | y validación de columnas)"
-            if lineas_sueltas_recuperadas:
-                muestra_lineas = ", ".join(str(n) for n in lineas_sueltas_recuperadas[:10])
-                sufijo = f"; línea(s) suelta(s) recuperada(s): {muestra_lineas}"
-                if len(lineas_sueltas_recuperadas) > 10:
-                    sufijo += f" y {len(lineas_sueltas_recuperadas) - 10} más"
-                descripcion_lectura += sufijo
-            return df, descripcion_lectura
+            return df, encoding + " (comillas tratadas como texto; delimitación por | y validación de columnas)"
 
         except (csv.Error, ValueError, IndexError) as exc:
             errores_parseo.append(f"{encoding}: {exc}")
@@ -655,11 +634,20 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
     mascara_mayor = mascara_etapa & horas.ge(UMBRAL_HORAS)
 
     tiendas = _asignar_tienda(df)
-    validos = df.loc[mascara_etapa].copy()
-    validos.insert(0, "Area procesada", region)
-    validos.insert(1, "Tienda asignada", tiendas.loc[mascara_etapa].values)
-    validos["Etapa normalizada"] = etapas.loc[mascara_etapa].values
-    validos["DilacionHorasEtapa numerica"] = horas.loc[mascara_etapa].values
+
+    def enriquecer_detalle(mascara: pd.Series) -> pd.DataFrame:
+        """Devuelve filas filtradas y añade región, tienda, etapa y dilación normalizadas."""
+        detalle = df.loc[mascara].copy()
+        detalle.insert(0, "Area procesada", region)
+        detalle.insert(1, "Tienda asignada", tiendas.loc[mascara].values)
+        detalle["Etapa normalizada"] = etapas.loc[mascara].values
+        detalle["DilacionHorasEtapa numerica"] = horas.loc[mascara].values
+        return detalle
+
+    # Separamos las filas que tienen etapa válida del subconjunto que realmente
+    # está pendiente: etapa válida Y dilación de 25 horas o más.
+    detalle_etapas_validas = enriquecer_detalle(mascara_etapa)
+    detalle_pendientes = enriquecer_detalle(mascara_mayor)
 
     resumen_datos = pd.DataFrame({
         "Tienda asignada": tiendas.loc[mascara_mayor].values,
@@ -684,13 +672,8 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         )
     if "comillas tratadas como texto" in encoding:
         advertencias.append(
-            "Las comillas se trataron como texto y | se usó como delimitador para evitar que una comilla suelta desplace las columnas."
-        )
-    if "línea(s) suelta(s) recuperada(s)" in encoding:
-        parte = encoding.split("línea(s) suelta(s) recuperada(s):", 1)[1].strip()
-        advertencias.append(
-            "Se recuperó una línea física sin separadores anexándola al último campo de la fila anterior. "
-            f"Línea(s): {parte}. Revisa el TXT original si necesitas auditar ese campo; las columnas de análisis se conservaron."
+            "La lectura CSV estándar detectó comillas sin cerrar. Se releyó tratando las comillas como texto para conservar las filas. "
+            "Si algún campo de texto contiene el delimitador |, revisa la sábana original."
         )
     if horas_invalidas:
         advertencias.append(f"{horas_invalidas:,} registros de etapas válidas tienen dilación vacía o no numérica y no entran al resumen.")
@@ -711,5 +694,12 @@ def procesar_archivo(contenido: bytes, region: str) -> dict[str, Any]:
         "bytes": len(contenido),
         "advertencias": advertencias,
     }
-    # Guardar la sábana entera solo en memoria de sesión si se requiere auditoría local; el detalle exportado incluye etapas válidas.
-    return {"resumen": resumen, "detalle": validos, "metricas": metrics}
+    # "detalle" se reserva para el Excel integrado: exclusivamente folios pendientes
+    # (etapa válida y dilación >= 25 h). La vista de todas las etapas válidas queda
+    # disponible por separado para auditoría/consulta si se requiere.
+    return {
+        "resumen": resumen,
+        "detalle": detalle_pendientes,
+        "detalle_etapas_validas": detalle_etapas_validas,
+        "metricas": metrics,
+    }
