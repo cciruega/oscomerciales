@@ -17,7 +17,7 @@ st.set_page_config(
 # Si falta el módulo o tiene un error de importación, mostrar el motivo en la página
 # en lugar de dejar una pantalla aparentemente en blanco.
 try:
-    from procesador_os import ETAPAS_VALIDAS, REGIONES, UMBRAL_HORAS, procesar_archivo
+    from procesador_os import ETAPAS_VALIDAS, REGIONES, UMBRAL_HORAS, VERSION_LECTOR, procesar_archivo
 except Exception as exc:
     st.title("Órdenes Comerciales Pendientes")
     st.error("No se pudo cargar el módulo procesador_os.py.")
@@ -72,7 +72,7 @@ for idx, region in enumerate(REGIONES, start=1):
     if archivo is not None:
         try:
             with st.spinner(f"Procesando {region}…"):
-                resultado = procesar_en_cache(archivo.getvalue(), region, "recuperacion-linea-aislada-v1")
+                resultado = procesar_en_cache(archivo.getvalue(), region, VERSION_LECTOR)
             resultados[region] = resultado
             m = resultado["metricas"]
             st.markdown(
@@ -236,3 +236,4 @@ else:
             st.error(f"No se pudo preparar el Excel: {exc}")
 
 st.caption("El portal procesa los archivos que cargues en la instancia de Streamlit; al ejecutarlo en tu PC, los archivos se procesan en tu equipo. No descarga automáticamente de la intranet ni elimina los TXT originales.")
+st.caption(f"Versión del lector de TXT: `{VERSION_LECTOR}`")
